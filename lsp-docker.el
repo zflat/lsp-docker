@@ -30,17 +30,22 @@
 (require 'lsp-mode)
 (require 'dash)
 
-(defun lsp-docker--uri->path (path-mappings docker-container-name uri)
+(defun lsp-docker--uri->path (path-mappings docker-container-name docker-container-user uri)
   "Turn docker URI into host path.
 Argument PATH-MAPPINGS dotted pair of (host-path . container-path).
 Argument DOCKER-CONTAINER-NAME name to use when running container.
+Argument DOCKER-CONTAINER-USER user id to use for opening files
+within the container
 Argument URI the uri to translate."
   (let ((path (lsp--uri-to-path-1 uri)))
     (-if-let ((local . remote) (-first (-lambda ((_ . docker-path))
                                          (s-contains? docker-path path))
                                        path-mappings))
         (s-replace remote local path)
-      (format "/docker:%s:%s" docker-container-name path))))
+      (format "/docker:%s%s:%s"
+	      (if docker-container-user (format "%s@" docker-container-user) "")
+	      docker-container-name
+	      path))))
 
 (defun lsp-docker--path->uri (path-mappings path)
   "Turn host PATH into docker uri.
@@ -60,63 +65,74 @@ Argument PATH the path to translate."
 (defvar lsp-docker-command "docker"
   "The docker command to use.")
 
-(defun lsp-docker-launch-new-container (docker-container-name path-mappings docker-image-id server-command)
+(defun lsp-docker-launch-new-container
+    (docker-container-name path-mappings docker-image-id docker-container-user server-command)
   "Return the docker command to be executed on host.
 Argument DOCKER-CONTAINER-NAME name to use for container.
 Argument PATH-MAPPINGS dotted pair of (host-path . container-path).
 Argument DOCKER-IMAGE-ID the docker container to run language servers with.
+Argument DOCKER-CONTAINER-USER the user to run the first process
+in the container. This can be specified to override the USER
+Dockerfile instruction.
 Argument SERVER-COMMAND the language server command to run inside the container."
-  (cl-incf lsp-docker-container-name-suffix)
   (split-string
-   (--doto (format "%s run --name %s-%d --rm -i %s %s %s"
+   (--doto (format "%s run --name %s --rm -i %s %s %s %s"
 		   lsp-docker-command
 		   docker-container-name
-		   lsp-docker-container-name-suffix
 		   (->> path-mappings
 			(-map (-lambda ((path . docker-path))
 				(format "-v %s:%s" path docker-path)))
 			(s-join " "))
+                   (if docker-container-user (format "--user=%s" docker-container-user) "")
 		   docker-image-id
 		   server-command))
    " "))
 
-(defun lsp-docker-exec-in-container (docker-container-name server-command)
+(defun lsp-docker-exec-in-container
+    (docker-container-name docker-container-user server-command)
   "Return command to exec into running container.
 Argument DOCKER-CONTAINER-NAME name of container to exec into.
+Argument DOCKER-CONTAINER-USER user to run the command in the container.
 Argument SERVER-COMMAND the command to execute inside the running container."
 (split-string
-   (format "docker exec -i %s %s" docker-container-name server-command)))
+ (format "docker exec -i %s %s %s"
+         (if docker-container-user (format "--user=%s" docker-container-user) "")
+         docker-container-name server-command)))
 
 (cl-defun lsp-docker-register-client (&key server-id
                                            docker-server-id
                                            path-mappings
                                            docker-image-id
                                            docker-container-name
+                                           docker-container-user
                                            priority
                                            server-command
                                            launch-server-cmd-fn)
   "Registers docker clients with lsp"
   (if-let ((client (copy-lsp--client (gethash server-id lsp-clients))))
       (progn
-        (setf (lsp--client-server-id client) docker-server-id
-              (lsp--client-uri->path-fn client) (-partial #'lsp-docker--uri->path
-                                                          path-mappings
-                                                          docker-container-name)
-              (lsp--client-path->uri-fn client) (-partial #'lsp-docker--path->uri path-mappings)
-              (lsp--client-new-connection client) (plist-put
-                                                   (lsp-stdio-connection
-                                                    (lambda ()
-                                                      (funcall (or launch-server-cmd-fn #'lsp-docker-launch-new-container)
-                                                               docker-container-name
-                                                               path-mappings
-                                                               docker-image-id
-                                                               server-command)))
-                                                   :test? (lambda (&rest _)
-                                                            (-any?
-                                                             (-lambda ((dir))
-                                                               (f-ancestor-of? dir (buffer-file-name)))
-                                                             path-mappings)))
-              (lsp--client-priority client) (or priority (lsp--client-priority client)))
+        (let ((docker-container-name-full (format "%s-%d" docker-container-name (cl-incf lsp-docker-container-name-suffix))))
+          (setf (lsp--client-server-id client) docker-server-id
+                (lsp--client-uri->path-fn client) (-partial #'lsp-docker--uri->path
+                                                            path-mappings
+                                                            docker-container-name-full
+                                                            docker-container-user)
+                (lsp--client-path->uri-fn client) (-partial #'lsp-docker--path->uri path-mappings)
+                (lsp--client-new-connection client) (plist-put
+                                                     (lsp-stdio-connection
+                                                      (lambda ()
+                                                        (funcall (or launch-server-cmd-fn #'lsp-docker-launch-new-container)
+                                                                 docker-container-name-full
+                                                                 path-mappings
+                                                                 docker-image-id
+                                                                 docker-container-user
+                                                                 server-command)))
+                                                     :test? (lambda (&rest _)
+                                                              (-any?
+                                                               (-lambda ((dir))
+                                                                 (f-ancestor-of? dir (buffer-file-name)))
+                                                               path-mappings)))
+                (lsp--client-priority client) (or priority (lsp--client-priority client))))
         (lsp-register-client client))
     (user-error "No such client %s" server-id)))
 
@@ -147,6 +163,7 @@ Argument SERVER-COMMAND the command to execute inside the running container."
 					path-mappings
 					(docker-image-id "emacslsp/lsp-docker-langservers")
 					(docker-container-name "lsp-container")
+                                        (docker-container-user nil)
 					(priority 10)
 					(client-packages lsp-docker-default-client-packages)
 					(client-configs lsp-docker-default-client-configs))
@@ -162,6 +179,11 @@ used for all clients, as a string.
 :docker-container-name is the name to use for the container when
 it is started.
 
+:docker-container-user is an optional user id to use for opening
+files within the container. When this option is specified, the
+xref uri will be '/docker:user@container-name:path'. When it is
+nil (default) the xref uri will be '/docker:container-name:path'.
+
 :priority is the priority with which to register the docker
 clients with lsp.  (See the library ‘lsp-clients’ for details.)
 
@@ -174,6 +196,7 @@ the form
   :docker-server-id 'examplels-docker
   :docker-image-id \"examplenamespace/examplels-docker:x.y\"
   :docker-container-name \"examplels-container\"
+  :docker-container-user \"root\"
   :server-command \"run_example_ls.sh\")
 where
 :server-id is the ID of the language server, as defined in the
@@ -192,11 +215,19 @@ function's :docker-container-name argument for just this client.
 This MUST be specified if :docker-image-id is specified, but is
 otherwise optional.
 
+:docker-container-user is an optional property to override this
+function's :docker-container-user argument for just this client.
+This option will always override if :docker-image-id is
+specified. This option defaults to nil.
+
 :server-command is a string specifying the command to run inside
 the docker container to run the language server."
   (seq-do (lambda (package) (require package nil t)) client-packages)
-  (let ((default-docker-image-id docker-image-id))
-    (seq-do (-lambda ((&plist :server-id :docker-server-id :docker-image-id :docker-container-name :server-command))
+  (let ((default-docker-image-id docker-image-id)
+	(default-docker-container-name docker-container-name)
+	(default-docker-container-user docker-container-user)
+)
+    (seq-do (-lambda ((&plist :server-id :docker-server-id :docker-image-id :docker-container-name :docker-container-user :server-command))
         (when (and docker-image-id (not docker-container-name))
           (user-error "Invalid client definition for server ID %S. You must specify a container name when specifying an image ID."
                  server-id))
@@ -207,7 +238,10 @@ the docker container to run the language server."
          :docker-image-id (or docker-image-id default-docker-image-id)
          :docker-container-name (if docker-image-id
                                     docker-container-name
-                                  default-docker-container-name)
+				  default-docker-container-name)
+         :docker-container-user (if docker-image-id
+                                    docker-container-user
+                                  default-docker-container-user)
          :server-command server-command
          :path-mappings path-mappings
          :launch-server-cmd-fn #'lsp-docker-launch-new-container))
